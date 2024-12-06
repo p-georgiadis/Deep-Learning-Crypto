@@ -1,0 +1,130 @@
+# configs/config.yaml
+
+data:
+  coins:
+    - bitcoin
+    - ethereum
+  days: 500
+  validation_split: 0.15
+  test_split: 0.15
+  scaler: minmax
+  symbol_mapping:
+    - symbol: "ETHBTC"
+      baseAsset: "ETH"
+      quoteAsset: "BTC"
+    - symbol: "LTCBTC"
+      baseAsset: "LTC"
+      quoteAsset: "BTC"
+    - symbol: "BNBBTC"
+      baseAsset: "BNB"
+      quoteAsset: "BTC"
+    - symbol: "BTCUSDT"
+      baseAsset: "BTC"
+      quoteAsset: "USDT"
+    - symbol: "ETHUSDT"
+      baseAsset: "ETH"
+      quoteAsset: "USDT"
+    - symbol: "BNBUSDT"
+      baseAsset: "BNB"
+      quoteAsset: "USDT"
+    - symbol: "ADAUSDT"
+      baseAsset: "ADA"
+      quoteAsset: "USDT"
+    - symbol: "SOLUSDT"
+      baseAsset: "SOL"
+      quoteAsset: "USDT"
+    - symbol: "LTCUSDT"
+      baseAsset: "LTC"
+      quoteAsset: "USDT"
+    - symbol: "LITUSDT"
+      baseAsset: "LIT"
+      quoteAsset: "USDT"
+    - symbol: "ETHBNB"
+      baseAsset: "ETH"
+      quoteAsset: "BNB"
+    - symbol: "LTCBNB"
+      baseAsset: "LTC"
+      quoteAsset: "BNB"
+    - symbol: "UNIETH"
+      baseAsset: "UNI"
+      quoteAsset: "ETH"
+    - symbol: "AAVEETH"
+      baseAsset: "AAVE"
+      quoteAsset: "ETH"
+    - symbol: "CAKEUSDT"
+      baseAsset: "CAKE"
+      quoteAsset: "USDT"
+    - symbol: "AXSUSDT"
+      baseAsset: "AXS"
+      quoteAsset: "USDT"
+    - symbol: "SANDUSDT"
+      baseAsset: "SAND"
+      quoteAsset: "USDT"
+    - symbol: "USDCUSDT"
+      baseAsset: "USDC"
+      quoteAsset: "USDT"
+    - symbol: "BUSDUSDT"
+      baseAsset: "BUSD"
+      quoteAsset: "USDT"
+  coin_map:
+    bitcoin: "BTC"
+    ethereum: "ETH"
+    litecoin: "LTC"
+    # Add other coins as needed
+
+preprocessing:
+ scaler: "robust"  # Better for crypto's outliers and volatility
+ augment: false  # Enable data augmentation
+ augmentation_techniques:
+   - random_shift: true
+   - random_sample: true
+   - gaussian_noise: 0.01
+ feature_selection: true
+ sequence_overlap: 0.5  # Sliding window overlap
+
+model:
+  sequence_length: 60  # Same as before
+  prediction_length: 1  # No change
+  lstm_units:
+    - 64  # Reduced from 128 for smaller model
+    - 32
+    - 16
+  dropout_rate: 0.2  # Reduced for faster convergence
+  dense_units:
+    - 32
+  attention_units: 32
+  learning_rate: 0.001  # Increased slightly for faster training
+  regularization: 0.0001  # No change
+
+
+training:
+  batch_size: 32
+  epochs: 100  # Reduced for quicker testing (can increase after testing stability)
+  early_stopping_patience: 10  # Adjust for smaller architecture
+  reduce_lr_patience: 5
+  min_delta: 0.0001  # Adjusted for faster improvements
+  checkpoint_frequency: 10
+
+logging:
+  name: 'crypto_predictor'
+  log_dir: 'logs'
+  console_level: 'INFO'
+  file_level: 'DEBUG'
+  rotation: 'time'
+  json_format: False
+
+paths:
+  data_dir: data
+  raw_data_dir: data/raw/train
+  raw_predict_dir: data/raw/predict
+  processed_data_dir: data/processed
+  models_dir: models
+  logs_dir: logs
+  model_logs_dir: /tmp/model_logs
+  results_dir: results
+  visualization_dir: visualizations
+  prediction_data_dir: data/prediction  # Directory for prediction input files
+  model_metadata_dir: models/metadata
+  model_to_load: models/*.keras
+  predict_data: data/prediction/prediction_data.csv  # Specific file for prediction input
+  predictions_output: results/predictions.json

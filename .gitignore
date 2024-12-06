@@ -1,0 +1,84 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Packages
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+*.log
+*.bak
+*.swp
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# PyCharm project files
+.idea/
+*.iml
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# MacOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Python specific
+*.env
+*.pyo
+*.pyc
+*.pyd
+
+# Logs
+logs/
+*.log
+
+# Configurations
+config.yaml.backup
+
+# Dataset files
+data/raw/
+data/processed/
+data/predict_data.csv
+
+# Models
+models/
+*.keras
+*.h5
+
+# Results
+results/
+*.json
+
+# Visualizations
+visualizations/
+*.html
+*.png
+*.svg
+
+# TensorBoard logs
+test_models/logs/
+
+# Miscellaneous
+*.bak
+*.tmp
+*.old
+*.swp
+
+# Ignore all temporary and backup files
+*~
