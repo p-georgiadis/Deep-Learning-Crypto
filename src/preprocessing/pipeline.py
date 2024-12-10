@@ -1,397 +1,372 @@
 # src/preprocessing/pipeline.py
-import json
+
 import logging
 from pathlib import Path
-from typing import Dict, Tuple, Union
-
+from typing import Dict, Tuple, Union, Optional
+import joblib
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler
-import joblib
-from .feature_engineering import FeatureEngineer
+from sklearn.preprocessing import RobustScaler, MinMaxScaler, StandardScaler
+import json
 
+from .feature_engineering import FeatureEngineer
+from src.utils.config import Config
 
 class Pipeline:
     """
-    Data preprocessing pipeline for cryptocurrency price prediction.
-
-    This class handles all data preprocessing steps including:
-    - Data cleaning and validation
+    The Pipeline class handles:
+    - Data validation and cleaning
     - Feature engineering
-    - Sequence creation
-    - Train/val/test splitting
-    - Feature scaling
+    - Normalization/scaling of non-target features and the target (close) separately
+    - For training: splitting data and preparing sequences (X, Y).
+    - For prediction: returning only the last sequence_length rows scaled for input.
     """
 
-    def __init__(self, sequence_length=60, prediction_length=1, test_size=0.2, validation_size=0.2):
-        """
-        Initialize the preprocessing pipeline.
-
-        Args:
-            sequence_length: Length of input sequences
-            prediction_length: Number of future time steps to predict
-            test_size: Proportion of data for testing
-            validation_size: Proportion of data for validation
-        """
-        self.sequence_length = sequence_length
-        self.prediction_length = prediction_length
-        self.test_size = test_size
-        self.validation_size = validation_size
-        self.scaler = RobustScaler()
-        self.feature_engineer = FeatureEngineer()
-        total_split = test_size + validation_size
-        if total_split >= 1.0:
-            raise ValueError("The sum of test_size and validation_size must be less than 1.")
-
-        # Set up logging
+    def __init__(
+        self,
+        config: Optional[Config] = None,
+        sequence_length: int = 60,
+        prediction_length: int = 1,
+        test_size: float = 0.2,
+        validation_size: float = 0.2,
+        feature_scaler_type: str = 'standard',
+        target_scaler_type: str = 'robust',
+    ):
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
-
         if not self.logger.handlers:
             handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            )
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
 
-    def augment_data(self, X, y, noise_level=0.01, shift_range=2):
-        """Add time series augmentation"""
-        X_aug, y_aug = [], []
+        self.config = config
 
-        # Original data
-        X_aug.extend(X)
-        y_aug.extend(y)
+        if config and isinstance(config, Config):
+            model_config = config.get_model_config()
+            data_config = config.get_data_config()
+            preprocessing_config = config.get_preprocessing_config()
 
-        # Add noise
-        noise = np.random.normal(0, noise_level, X.shape)
-        X_aug.extend(X + noise)
-        y_aug.extend(y)
+            self.sequence_length = model_config.get('sequence_length', sequence_length)
+            self.prediction_length = model_config.get('prediction_length', prediction_length)
 
-        # Time shift
-        for shift in range(-shift_range, shift_range + 1):
-            if shift != 0:
-                X_aug.extend(np.roll(X, shift, axis=1))
-                y_aug.extend(y)
+            self.test_size = data_config.get('test_split', test_size)
+            self.validation_size = data_config.get('validation_split', validation_size)
 
-        return np.array(X_aug), np.array(y_aug)
+            scaling_config = preprocessing_config.get('scaling', {})
+            self.feature_scaler_type = scaling_config.get('feature_scaler_type', feature_scaler_type)
+            self.target_scaler_type = scaling_config.get('target_scaler_type', target_scaler_type)
+        else:
+            self.sequence_length = sequence_length
+            self.prediction_length = prediction_length
+            self.test_size = test_size
+            self.validation_size = validation_size
+            self.feature_scaler_type = feature_scaler_type
+            self.target_scaler_type = target_scaler_type
 
-    def validate_data(self, df: pd.DataFrame) -> None:
-        """
-        Validate input data.
+        if self.test_size + self.validation_size >= 1.0:
+            raise ValueError("Sum of test_size and validation_size must be less than 1.")
 
-        Args:
-            df: Input DataFrame
+        self.scaler = self._initialize_scaler(self.feature_scaler_type)
+        self.target_scaler = self._initialize_scaler(self.target_scaler_type)
 
-        Raises:
-            ValueError: If data validation fails
-        """
+        self.numeric_features = []
+        self.scalers_fitted = False
+
+        fe_config = None
+        if self.config:
+            preprocessing_config = self.config.get_preprocessing_config()
+            if preprocessing_config and 'feature_engineering' in preprocessing_config:
+                fe_config = preprocessing_config['feature_engineering']
+
+        self.feature_engineer = FeatureEngineer(config=fe_config)
+
+        self.logger.info(f"Pipeline initialized with sequence_length={self.sequence_length}, "
+                         f"prediction_length={self.prediction_length}, test_size={self.test_size}, "
+                         f"validation_size={self.validation_size}, "
+                         f"feature_scaler_type={self.feature_scaler_type}, target_scaler_type={self.target_scaler_type}")
+
+    @staticmethod
+    def _initialize_scaler(scaler_type: str):
+        if scaler_type == 'minmax':
+            return MinMaxScaler()
+        elif scaler_type == 'robust':
+            return RobustScaler()
+        elif scaler_type == 'standard':
+            return StandardScaler()
+        else:
+            raise ValueError(f"Unsupported scaler type: {scaler_type}")
+
+    def _update_numeric_features(self, df: pd.DataFrame):
+        # Exclude 'close' from numeric_features to ensure it's only scaled by target_scaler
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        self.numeric_features = [col for col in numeric_cols if col != 'close']
+        self.logger.info(f"Numeric features identified (excluding close): {self.numeric_features}")
+
+    def validate_data(self, df: pd.DataFrame):
         if df.empty:
-            raise ValueError("Empty DataFrame provided")
+            raise ValueError("Input DataFrame is empty.")
 
         required_columns = ['open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required_columns):
-            raise ValueError(f"Missing required columns. Required: {required_columns}")
+        missing = [col for col in required_columns if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
 
-        if df.isnull().any().any():
-            raise ValueError("DataFrame contains missing values")
-
-    '''
-    def process_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle outliers in the data using a wider IQR range for crypto."""
-        df_clean = df.copy()
-
-        for column in df_clean.select_dtypes(include=[np.number]).columns:
-            Q1 = df_clean[column].quantile(0.25)
-            Q3 = df_clean[column].quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - 5 * IQR  # Increased from 3 to 5 for crypto
-            upper_bound = Q3 + 5 * IQR
-
-            df_clean[column] = df_clean[column].clip(lower=lower_bound,
-                                                     upper=upper_bound)
-
-        return df_clean
-    '''
+        if df[required_columns].isnull().values.any():
+            raise ValueError("Required columns contain missing values.")
 
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Create all features for the model.
-
-        Args:
-            df: Input DataFrame
-
-        Returns:
-            DataFrame with additional features
-        """
-        return self.feature_engineer.add_technical_features(df)
+        self.logger.info("Applying feature engineering...")
+        df_features = self.feature_engineer.add_technical_features(df)
+        return df_features
 
     def fit_normalize_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Fit the scaler on the training data and transform it.
+        if df.empty:
+            raise ValueError("Input DataFrame is empty.")
+        df_scaled = df.copy()
+        self._update_numeric_features(df_scaled)
 
-        Args:
-            df: Training DataFrame to fit and transform.
+        if self.config:
+            scaling_config = self.config.get_preprocessing_config().get('scaling', {})
+            if scaling_config.get('price_transform') == 'log1p':
+                self.logger.info("Applying log1p transformation to price columns (open, high, low, close).")
+                price_cols = ['open', 'high', 'low', 'close']
+                df_scaled[price_cols] = np.log1p(df_scaled[price_cols])
 
-        Returns:
-            Normalized DataFrame.
-        """
-        numeric_features = df.select_dtypes(include=[np.number]).columns
-        self.numeric_features = numeric_features  # Save for later use
-        scaled_data = self.scaler.fit_transform(df[numeric_features])
-        return pd.DataFrame(scaled_data, columns=numeric_features, index=df.index)
+            if scaling_config.get('volume_transform') == 'log1p':
+                self.logger.info("Applying log1p transformation to volume.")
+                df_scaled['volume'] = np.log1p(df_scaled['volume'])
+
+        # Scale numeric features (excluding 'close')
+        if self.numeric_features:
+            self.logger.info("Fitting scaler on numeric features.")
+            df_scaled[self.numeric_features] = self.scaler.fit_transform(df_scaled[self.numeric_features])
+
+        # Scale target close separately
+        if 'close' in df_scaled.columns:
+            self.logger.info("Fitting scaler on target ('close').")
+            df_scaled['close'] = self.target_scaler.fit_transform(df_scaled[['close']]).flatten()
+
+        self.scalers_fitted = True
+        return df_scaled
 
     def normalize_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Transform data using the already fitted scaler.
+        if df.empty:
+            raise ValueError("Input DataFrame is empty.")
+        if not self.scalers_fitted:
+            raise ValueError("Scalers have not been fitted. Call fit_normalize_features first.")
 
-        Args:
-            df: Input DataFrame to transform.
+        df_scaled = df.copy()
 
-        Returns:
-            Normalized DataFrame.
-        """
-        if not hasattr(self.scaler, 'center_'):
-            raise ValueError("Scaler has not been fitted yet. Call 'fit_normalize_features' first.")
-        numeric_features = self.numeric_features  # Use the same features as during fitting
-        scaled_data = self.scaler.transform(df[numeric_features])
-        return pd.DataFrame(scaled_data, columns=numeric_features, index=df.index)
+        if self.config:
+            scaling_config = self.config.get_preprocessing_config().get('scaling', {})
+            if scaling_config.get('price_transform') == 'log1p':
+                self.logger.info("Applying log1p transform to price columns.")
+                price_cols = ['open', 'high', 'low', 'close']
+                existing_price_cols = [c for c in price_cols if c in df_scaled.columns]
+                if existing_price_cols:
+                    df_scaled[existing_price_cols] = np.log1p(df_scaled[existing_price_cols])
+
+            if scaling_config.get('volume_transform') == 'log1p' and 'volume' in df_scaled.columns:
+                self.logger.info("Applying log1p transform to volume.")
+                df_scaled['volume'] = np.log1p(df_scaled['volume'])
+
+        # Temporarily remove close for feature scaling
+        close_col = None
+        if 'close' in df_scaled.columns:
+            close_col = df_scaled['close'].copy()
+            df_scaled.drop(columns=['close'], inplace=True, errors='ignore')
+
+        # Ensure only known numeric_features remain
+        all_current_numeric = df_scaled.select_dtypes(include=[np.number]).columns.tolist()
+        current_set = set(all_current_numeric)
+        expected_set = set(self.numeric_features)
+
+        extra_features = current_set - expected_set
+        if extra_features:
+            self.logger.warning(f"Dropping extra numeric features not seen at fit time: {extra_features}")
+            df_scaled.drop(columns=list(extra_features), inplace=True, errors='ignore')
+
+        missing_features = expected_set - set(df_scaled.columns)
+        for mf in missing_features:
+            self.logger.warning(f"Missing feature {mf} at prediction time. Filling with zeros.")
+            df_scaled[mf] = 0.0
+
+        df_scaled = df_scaled.reindex(columns=self.numeric_features, fill_value=0.0)
+        df_scaled[self.numeric_features] = self.scaler.transform(df_scaled[self.numeric_features])
+
+        # Re-add close using target_scaler if it existed
+        if close_col is not None:
+            close_scaled = self.target_scaler.transform(close_col.to_frame()).flatten()
+            df_scaled['close'] = close_scaled
+
+        return df_scaled
+
+    def run(self, df: pd.DataFrame, save_dir: Optional[str] = None, prediction_mode: bool = False) -> Dict[str, np.ndarray]:
+        if df.empty:
+            raise ValueError("Input DataFrame is empty.")
+        self.validate_data(df)
+        df_features = self.create_features(df)
+
+        if df_features.isnull().values.any():
+            self.logger.warning("Missing values detected, applying bfill and ffill.")
+            df_features.bfill(inplace=True)
+            df_features.ffill(inplace=True)
+
+        if df_features.empty:
+            raise ValueError("No data left after handling missing values.")
+
+        self._update_numeric_features(df_features)
+
+        if prediction_mode:
+            if self.scalers_fitted:
+                df_normalized = self.normalize_features(df_features)
+            else:
+                df_normalized = self.fit_normalize_features(df_features)
+
+            if len(df_normalized) < self.sequence_length:
+                raise ValueError("Not enough data to form one sequence for prediction.")
+
+            last_seq = df_normalized.iloc[-self.sequence_length:]
+            X = np.expand_dims(last_seq.values, axis=0)
+            return {'X': X}
+
+        train_df, val_df, test_df = self.split_data(df_features)
+
+        train_norm = self.fit_normalize_features(train_df)
+        val_norm = self.normalize_features(val_df)
+        test_norm = self.normalize_features(test_df)
+
+        X_train, Y_train = self.prepare_sequences(train_norm)
+        X_val, Y_val = self.prepare_sequences(val_norm)
+        X_test, Y_test = self.prepare_sequences(test_norm)
+
+        result = {
+            'X_train': X_train,
+            'y_train': Y_train,
+            'X_val': X_val,
+            'y_val': Y_val,
+            'X_test': X_test,
+            'y_test': Y_test,
+            'numeric_features': self.numeric_features
+        }
+
+        if save_dir:
+            self.save_processed_data(result, save_dir)
+            scaler_dir = Path(save_dir) / "scalers"
+            scaler_dir.mkdir(parents=True, exist_ok=True)
+            self.save_scaler(
+                scaler_dir / "feature_scaler.joblib",
+                scaler_dir / "target_scaler.joblib"
+            )
+
+        return result
 
     def prepare_sequences(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Create sequences for time series prediction.
+        if df.empty:
+            raise ValueError("Empty DataFrame, cannot prepare sequences.")
+        if len(df) < self.sequence_length + self.prediction_length:
+            raise ValueError("Not enough data to create sequences.")
 
-        Args:
-            df: Input DataFrame with scaled features and target.
+        X, Y = [], []
+        max_start_idx = len(df) - self.sequence_length - self.prediction_length + 1
 
-        Returns:
-            Tuple of (X sequences, y targets).
-        """
-        X, y = [], []
-        for i in range(len(df) - self.sequence_length - self.prediction_length + 1):
-            # Create a sequence of features
-            sequence = df.iloc[i:(i + self.sequence_length)]
-            # Create the target based on the forecast horizon
-            target = df.iloc[i + self.sequence_length:i + self.sequence_length + self.prediction_length]['close']
+        for i in range(max_start_idx):
+            seq = df.iloc[i:i + self.sequence_length]
+            tgt_idx = i + self.sequence_length
+            tgt_close = df.iloc[tgt_idx]['close']
 
-            X.append(sequence.values)
-            y.append(target.values)
+            prev_close = df.iloc[tgt_idx - 1]['close'] if (tgt_idx - 1) >= 0 else tgt_close
 
-        # Debugging: Ensure alignment of sequences and targets
-        assert len(X) == len(y), f"Sequence and target length mismatch: {len(X)} != {len(y)}"
-        self.logger.info(f"Created {len(X)} sequences with {self.sequence_length} time steps each.")
-        return np.array(X), np.array(y)
+            Y.append([tgt_close, prev_close])
+            X.append(seq.values)
+
+        self.logger.info(f"Created {len(X)} sequences of length {self.sequence_length}.")
+        return np.array(X), np.array(Y)
 
     def split_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Split data into train, validation, and test sets.
+        min_size = max(self.sequence_length + self.prediction_length, 200)
+        if len(df) < min_size * 3:
+            raise ValueError("Not enough data for splitting into train/val/test.")
 
-        Args:
-            df: Input DataFrame with features.
-
-        Returns:
-            Tuple of (train, val, test DataFrames).
-        """
         train_size = 1 - self.test_size - self.validation_size
-
         n = len(df)
+        buffer_size = 100
         train_end = int(n * train_size)
         val_end = train_end + int(n * self.validation_size)
 
-        train = df.iloc[:train_end]
-        val = df.iloc[train_end:val_end]
-        test = df.iloc[val_end:]
+        train = df.iloc[:train_end + buffer_size].copy()
+        val = df.iloc[max(0, train_end - buffer_size):val_end + buffer_size].copy()
+        test = df.iloc[max(0, val_end - buffer_size):].copy()
 
-        # Debugging: Check if the splits are sufficient
-        min_required_length = self.sequence_length + self.prediction_length - 1
-        assert len(train) >= min_required_length, f"Insufficient training data for sequences (length: {len(train)})."
-        assert len(val) >= min_required_length, f"Insufficient validation data for sequences (length: {len(val)})."
-        assert len(test) >= min_required_length, f"Insufficient test data for sequences (length: {len(test)})."
-
-        self.logger.info(f"Data split complete: Train={len(train)}, Val={len(val)}, Test={len(test)}")
+        self.logger.info(f"Data split: Train={len(train)}, Val={len(val)}, Test={len(test)}")
         return train, val, test
 
-    def save_processed_data(self, processed_data: Dict[str, Union[np.ndarray, RobustScaler]], save_dir: str) -> None:
-        """
-        Save preprocessed data to disk.
-
-        Args:
-            processed_data: Dictionary containing processed data (X_train, y_train, etc.)
-            save_dir: Directory to save the processed data
-        """
+    def save_processed_data(self, processed_data: Dict[str, np.ndarray], save_dir: str):
         save_path = Path(save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
-
         for key, value in processed_data.items():
             if isinstance(value, np.ndarray):
                 np.save(save_path / f"{key}.npy", value)
-            elif isinstance(value, RobustScaler):
-                # Save the scaler using joblib
-                joblib.dump(value, save_path / f"{key}.joblib")
+            elif key == 'numeric_features' and isinstance(value, list):
+                with open(save_path / f"{key}.json", 'w') as f:
+                    json.dump(value, f)
             else:
-                self.logger.warning(
-                    f"Unrecognized data type for key '{key}' and value type '{type(value)}'. Skipping save.")
+                self.logger.warning(f"Skipping saving {key}, unrecognized type {type(value)}")
 
-    @staticmethod
-    def load_processed_data(load_dir: str) -> Dict[str, Union[np.ndarray, RobustScaler]]:
-        """
-        Load preprocessed data from disk.
+    def save_scaler(self, scaler_path: Union[str, Path], target_scaler_path: Union[str, Path]):
+        scaler_path = Path(scaler_path)
+        target_scaler_path = Path(target_scaler_path)
+        joblib.dump(self.scaler, scaler_path)
+        joblib.dump(self.target_scaler, target_scaler_path)
+        self.logger.info(f"Saved scalers to {scaler_path} and {target_scaler_path}")
+        self.scalers_fitted = True
 
-        Args:
-            load_dir: Directory where processed data is stored
+    def load_scaler(self, scaler_path: Union[str, Path], target_scaler_path: Union[str, Path]):
+        scaler_path = Path(scaler_path)
+        target_scaler_path = Path(target_scaler_path)
 
-        Returns:
-            Dictionary with processed data
-        """
-        load_path = Path(load_dir)
-        processed_data = {}
+        if not scaler_path.exists() or not target_scaler_path.exists():
+            raise FileNotFoundError("Scaler files not found.")
 
-        for file in load_path.iterdir():
-            if file.suffix == '.npy':
-                processed_data[file.stem] = np.load(file, allow_pickle=True)
-            elif file.suffix == '.joblib':
-                processed_data[file.stem] = joblib.load(file)
-            else:
-                # Skip other files or handle as needed
-                continue
-
-        return processed_data
-
-    def transform(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """
-        Preprocess new data for prediction.
-
-        Args:
-            df: Raw input DataFrame for prediction.
-
-        Returns:
-            Dictionary containing preprocessed sequences ('X') and other metadata if needed.
-        """
-        try:
-            self.logger.info("Starting preprocessing for prediction data")
-
-            # Step 1: Validate input data
-            self.validate_data(df)
-
-            # Step 2: Handle outliers
-            df_clean = self.process_outliers(df)
-
-            # Step 3: Create features
-            df_features = self.create_features(df_clean)
-
-            # Step 4: Handle missing values
-            if df_features.isnull().any().any():
-                self.logger.warning("Missing values detected after feature engineering. Filling or dropping NaNs.")
-                df_features.fillna(method='bfill', inplace=True)  # Backfill
-                df_features.dropna(inplace=True)  # Drop remaining NaNs
-
-            # Step 5: Normalize features
-            if not hasattr(self.scaler, 'center_') or not hasattr(self.scaler, 'scale_'):
-                raise ValueError("Scaler must be fitted before transforming data.")
-            normalized_data = self.scaler.transform(df_features)
-            df_normalized = pd.DataFrame(
-                normalized_data,
-                columns=df_features.columns,
-                index=df_features.index
-            )
-
-            # Step 6: Create sequences
-            self.logger.info("Creating sequences for prediction")
-            X, _ = self.prepare_sequences(df_normalized)
-
-            self.logger.info(f"Prediction data preprocessing complete. Sequences shape: {X.shape}")
-            return {'X': X}
-
-        except Exception as e:
-            self.logger.error(f"Error preprocessing prediction data: {str(e)}")
-            raise
-
-    def run(self, df: pd.DataFrame, save_dir: str = None, prediction_mode: bool = False) -> Dict[
-        str, Union[np.ndarray, RobustScaler]]:
-        """
-        Run the complete preprocessing pipeline.
-
-        Args:
-            df: Raw input DataFrame.
-            save_dir: Directory to save processed data (optional).
-            prediction_mode: Whether to process data for prediction.
-
-        Returns:
-            Dictionary containing processed data or scaler (for prediction mode).
-        """
-        try:
-            self.logger.info("Starting preprocessing pipeline")
-
-            # Step 1: Validate input data
-            self.validate_data(df)
-
-            # Step 2: Process outliers
-            #df_clean = self.process_outliers(df)
-
-            # Step 3: Create features
-            df_features = self.create_features(df)
-            self.logger.info(f"Data length after feature engineering: {len(df_features)}")
-
-            # **Step 4: Handle missing values**
-            if df_features.isnull().any().any():
-                self.logger.warning("Missing values detected after feature engineering")
-                df_features = df_features.bfill()
-                df_features.dropna(inplace=True)
-
-            # **Step 5: Split data into train, validation, and test sets**
-            # Now split the data
-            train_df, val_df, test_df = self.split_data(df_features)
-
-            # **Step 6: Normalize features using only training data**
-            train_normalized = self.fit_normalize_features(train_df)
-
-            # Use the same columns as the training set for validation and test
-            val_normalized = self.normalize_features(val_df)
-            test_normalized = self.normalize_features(test_df)
-
-            # Debugging: Verify feature consistency
-            self.logger.info(f"Train features: {train_normalized.columns.tolist()}")
-            self.logger.info(f"Validation features: {val_normalized.columns.tolist()}")
-            self.logger.info(f"Test features: {test_normalized.columns.tolist()}")
-
-            # **Step 7: Create sequences**
-            X_train, y_train = self.prepare_sequences(train_normalized)
-            X_val, y_val = self.prepare_sequences(val_normalized)
-            X_test, y_test = self.prepare_sequences(test_normalized)
-
-            # Debugging: Check example sequences and targets
-            for i in range(min(5, len(X_train))):
-                self.logger.info(f"X_train[{i}] = {X_train[i]}")
-                self.logger.info(f"y_train[{i}] = {y_train[i]}")
-
-            self.logger.info(f"Preprocessing complete. Training sequences shape: {X_train.shape}")
-
-            processed_data = {
-                'X_train': X_train,
-                'y_train': y_train,
-                'X_val': X_val,
-                'y_val': y_val,
-                'X_test': X_test,
-                'y_test': y_test,
-                'scaler': self.scaler,
-                'numeric_features': self.numeric_features
-            }
-
-            # Save the processed data if a directory is provided
-            if save_dir:
-                self.save_processed_data(processed_data, save_dir)
-
-            return processed_data
-
-        except Exception as e:
-            self.logger.error(f"Error in preprocessing pipeline: {str(e)}")
-            raise
-
-    def load_scaler(self, scaler_path: str):
-        """
-        Load the scaler from a file.
-
-        Args:
-            scaler_path: Path to the saved scaler file.
-        """
         self.scaler = joblib.load(scaler_path)
+        self.target_scaler = joblib.load(target_scaler_path)
+        self.scalers_fitted = True
+        self.logger.info(f"Loaded scalers from {scaler_path} and {target_scaler_path}")
+
+    def inverse_transform_predictions(self, predictions: np.ndarray) -> np.ndarray:
+        if predictions.ndim == 1:
+            predictions = predictions.reshape(-1, 1)
+
+        inverse_scaled = self.target_scaler.inverse_transform(predictions)
+        if self.config and self.config.get_preprocessing_config().get('scaling', {}).get('price_transform') == 'log1p':
+            inverse_scaled = np.expm1(inverse_scaled)
+
+        return inverse_scaled.flatten()
+
+    def inverse_transform_actuals(self, y: np.ndarray) -> np.ndarray:
+        actual_prices = y[:,0].reshape(-1,1)
+        inverse_actual = self.target_scaler.inverse_transform(actual_prices)
+        if self.config and self.config.get_preprocessing_config().get('scaling', {}).get('price_transform') == 'log1p':
+            inverse_actual = np.expm1(inverse_actual)
+        return inverse_actual.flatten()
+
+    def save(self, path: Union[str, Path]):
+        path = Path(path)
+        joblib.dump({
+            'scaler': self.scaler,
+            'target_scaler': self.target_scaler,
+            'numeric_features': self.numeric_features
+        }, path)
+        self.logger.info(f"Pipeline saved to {path}")
+
+    @classmethod
+    def load(cls, path: Union[str, Path]):
+        data = joblib.load(path)
+        pipeline = cls()
+        pipeline.scaler = data['scaler']
+        pipeline.target_scaler = data['target_scaler']
+        pipeline.numeric_features = data['numeric_features']
+        pipeline.scalers_fitted = True
+        logging.info(f"Pipeline loaded from {path}")
+        return pipeline

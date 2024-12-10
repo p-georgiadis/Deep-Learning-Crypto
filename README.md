@@ -29,10 +29,10 @@ Crypto_Prediction/
 │   ├── monitoring/       # Monitoring dashboard
 │   └── utils/            # Utility functions
 ├── tests/                # Test files
-├── notebooks/            # Jupyter notebooks
+├── Final_Project_Report.ipynb # Findings and Evaluations
 ├── configs/              # Configuration files
 ├── logs/                 # Log files
-├── results/              # Training results
+├── results/              # Training & Prediction results
 └── visualizations/       # Generated plots
 ```
 
@@ -91,19 +91,19 @@ This interactive application will guide you through:
 ### Training a New Model
 Train the model independently:
 ```bash
-python main.py --config configs/config.yaml --log-level INFO --mode train
+python main.py --config configs/config.yaml --mode train
 ```
 
 ### Making Predictions Only
 Use a pre-trained model to generate predictions:
 ```bash
-python main.py --config configs/config.yaml --log-level INFO --mode predict
+python main.py --config configs/config.yaml --mode predict
 ```
 
 ### Updating Data Only
 Update data without proceeding to model training:
 ```bash
-python main.py --config configs/config.yaml --log-level INFO --mode collect-data
+python main.py --config configs/config.yaml --mode collect-data
 ```
 
 ## Monitoring Dashboard

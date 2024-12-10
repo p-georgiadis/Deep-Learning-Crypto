@@ -8,30 +8,6 @@ for tool in yq jq python; do
     fi
 done
 
-create_directories() {
-    echo "Ensuring required directories exist..."
-    required_paths=$(yq '.paths | .[]' configs/config.yaml 2>/dev/null)
-
-    if [ -z "$required_paths" ]; then
-        echo "No paths found in config.yaml under .paths. Skipping directory creation."
-        return
-    fi
-
-    while IFS= read -r path; do
-        # Strip surrounding quotes
-        path=$(echo "$path" | sed 's/^"//;s/"$//')
-
-        # Attempt to create directory for the path
-        dir_to_create=$(dirname "$path")
-        if [ ! -d "$dir_to_create" ]; then
-            echo "Creating directory: $dir_to_create"
-            mkdir -p "$dir_to_create"
-        fi
-    done <<< "$required_paths"
-
-    echo "All required directories are in place."
-}
-
 choose_coins() {
     echo "Available coins from config.yaml:"
     coin_list=$(yq '.data.coins[]' "$CONFIG_FILE" 2>/dev/null)
@@ -96,55 +72,6 @@ choose_config() {
     echo "Using configuration file: $CONFIG_FILE"
 }
 
-list_models() {
-    if [ ! -d models ]; then
-        echo "Error: models directory does not exist. Train a model first."
-        exit 1
-    fi
-
-    shopt -s nullglob
-    meta_files=(models/*.json)
-    shopt -u nullglob
-
-    if [ ${#meta_files[@]} -eq 0 ]; then
-        echo "No model metadata files found in models directory. Please train a model before selecting one."
-        exit 1
-    fi
-
-    for meta_file in "${meta_files[@]}"; do
-        coin_name=$(jq -r ".coin_name" "$meta_file")
-        timestamp=$(jq -r ".timestamp" "$meta_file")
-        model_file=$(basename "$meta_file" .json).keras
-        echo "Model: $model_file | Coin: $coin_name | Timestamp: $timestamp"
-    done
-}
-
-select_model() {
-    echo "Would you like to select a specific model or use the latest?"
-    echo "1) Use latest"
-    echo "2) Select a specific model"
-    read -p "Enter your choice (1 or 2): " model_choice
-
-    if [ "$model_choice" -eq 2 ]; then
-        list_models
-        read -p "Enter the model filename to use: " selected_model
-        if [[ -f "models/$selected_model" ]]; then
-            MODEL_PATH="models/$selected_model"
-            echo "Selected model: $selected_model"
-        else
-            echo "Error: Model file not found. Exiting."
-            exit 1
-        fi
-    else
-        MODEL_PATH=$(ls -t models/*.keras 2>/dev/null | head -n 1)
-        if [[ -z "$MODEL_PATH" ]]; then
-            echo "Error: No .keras models found in the models directory. Exiting."
-            exit 1
-        fi
-        echo "Using latest model: $(basename "$MODEL_PATH")"
-    fi
-}
-
 choose_mode() {
     echo "Select a mode to run the application:"
     echo "1) Collect Data"
@@ -169,10 +96,6 @@ run_mode() {
     echo "Coins: ${COINS:-Default from config.yaml}"
     echo "-------------------------------------"
 
-    if [[ "$MODE" == "predict" ]]; then
-        select_model
-    fi
-
     read -p "Do you want to proceed? (y/n): " confirm
     if [[ "$confirm" != "y" ]]; then
         echo "Operation cancelled by the user. Exiting."
@@ -182,15 +105,15 @@ run_mode() {
     echo "Running in $MODE mode..."
     if [[ "$MODE" == "predict" ]]; then
         if [ -z "$COINS" ]; then
-            python main.py --config "$CONFIG_FILE" --log-level INFO --mode "$MODE" --model "$MODEL_PATH"
+            python main.py --config "$CONFIG_FILE" --mode "$MODE"
         else
-            python main.py --config "$CONFIG_FILE" --log-level INFO --mode "$MODE" --coins $COINS --model "$MODEL_PATH"
+            python main.py --config "$CONFIG_FILE" --mode "$MODE" --coins $COINS
         fi
     else
         if [ -z "$COINS" ]; then
-            python main.py --config "$CONFIG_FILE" --log-level INFO --mode "$MODE"
+            python main.py --config "$CONFIG_FILE" --mode "$MODE"
         else
-            python main.py --config "$CONFIG_FILE" --log-level INFO --mode "$MODE" --coins $COINS
+            python main.py --config "$CONFIG_FILE" --mode "$MODE" --coins $COINS
         fi
     fi
 
@@ -204,7 +127,6 @@ run_mode() {
 }
 
 echo "Welcome to the Cryptocurrency Prediction App!"
-create_directories
 
 while true; do
     echo

@@ -1,441 +1,187 @@
 # src/training/model.py
+
 import json
 import logging
-from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional, Union
-
+from typing import List, Tuple, Optional, Union, Dict, Callable
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import Model, Input
-from tensorflow.keras.layers import (
-    LSTM,
-    Dense,
-    Dropout,
-    BatchNormalization,
-    Bidirectional,
-    Attention,
-    GlobalAveragePooling1D,
-)
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
 from tensorflow.keras.metrics import RootMeanSquaredError
+from tensorflow.keras.optimizers import Adam
+from src.utils.custom_losses import di_mse_loss, directional_accuracy
 
-
-def directional_accuracy(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    """
-    Calculate directional accuracy between true and predicted values.
-
-    Args:
-        y_true: True values (batch_size, 1)
-        y_pred: Predicted values (batch_size, 1)
-
-    Returns:
-        Directional accuracy score
-    """
-    # Ensure y_true and y_pred are 1D tensors
-    y_true = tf.reshape(y_true, (-1,))
-    y_pred = tf.reshape(y_pred, (-1,))
-
-    # Compute direction
-    y_true_direction = tf.sign(y_true[1:] - y_true[:-1])
-    y_pred_direction = tf.sign(y_pred[1:] - y_pred[:-1])
-
-    # Calculate accuracy
-    accurate_directions = tf.cast(
-        tf.equal(y_true_direction, y_pred_direction),
-        tf.float32
-    )
-
-    return tf.reduce_mean(accurate_directions)
 
 
 class CryptoPredictor:
-    """
-    Deep Learning model for cryptocurrency price prediction.
-    """
-
     def __init__(
         self,
         input_shape: Tuple[int, int],
-        lstm_units: List[int],
-        dropout_rate: float,
-        dense_units: List[int],
-        attention_units: int = 64,
+        lstm_units: Optional[List[int]] = None,
+        dropout_rate: float = 0.2,
+        dense_units: Optional[List[int]] = None,
         learning_rate: float = 0.001,
+        clip_norm: Optional[float] = None,
     ):
-        """
-        Initialize the model.
-
-        Args:
-            input_shape: Shape of input data (sequence_length, features)
-            lstm_units: List of units for each LSTM layer
-            dropout_rate: Dropout rate for regularization
-            dense_units: List of units for dense layers
-            attention_units: Units for the attention mechanism (default: 64)
-            learning_rate: Learning rate for optimization (default: 0.001)
-        """
-        # Validate parameters
-        self._validate_params(
-            input_shape, lstm_units, dropout_rate, dense_units, attention_units, learning_rate
-        )
+        self.logger = self._setup_logger()
 
         self.input_shape = input_shape
-        self.lstm_units = lstm_units
+        self.lstm_units = lstm_units or [64]
         self.dropout_rate = dropout_rate
-        self.dense_units = dense_units
+        self.dense_units = dense_units or [32]
         self.learning_rate = learning_rate
-        self.attention_units = attention_units
+        self.clip_norm = clip_norm
+
         self.model = None
         self.compiled = False
 
-        # Set up logging
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
-
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-            )
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-
-        # Log initialized parameters
         self.logger.info(
-            f"Initialized CryptoPredictor with lstm_units: {self.lstm_units}, "
-            f"dense_units: {self.dense_units}, dropout_rate: {self.dropout_rate}, "
-            f"learning_rate: {self.learning_rate}, attention_units: {self.attention_units}"
+            f"CryptoPredictor init: LSTM units={self.lstm_units}, "
+            f"Dense units={self.dense_units}, Dropout={self.dropout_rate}, "
+            f"LR={self.learning_rate}, Clip Norm={self.clip_norm}"
         )
 
-    def _validate_params(
-        self,
-        input_shape: Tuple[int, int],
-        lstm_units: List[int],
-        dropout_rate: float,
-        dense_units: List[int],
-        attention_units: int,
-        learning_rate: float,
-    ) -> None:
-        """
-        Validate model parameters.
-
-        Args:
-            input_shape: Shape of input data
-            lstm_units: List of LSTM units
-            dropout_rate: Dropout rate
-            dense_units: List of dense units
-            attention_units: Attention units
-            learning_rate: Learning rate
-
-        Raises:
-            ValueError: If parameters are invalid
-        """
-        if not all(x > 0 for x in input_shape):
-            raise ValueError("Input shape dimensions must be positive")
-
-        if not all(units > 0 for units in lstm_units):
-            raise ValueError("LSTM units must be positive")
-
-        if not all(units > 0 for units in dense_units):
-            raise ValueError("Dense units must be positive")
-
-        if not 0 <= dropout_rate < 1:
-            raise ValueError("Dropout rate must be between 0 and 1")
-
-        if attention_units <= 0:
-            raise ValueError("Attention units must be positive")
-
-        if learning_rate <= 0:
-            raise ValueError("Learning rate must be positive")
+    @staticmethod
+    def _setup_logger() -> logging.Logger:
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        return logger
 
     def build(self) -> None:
-        """Build simplified and optimized model architecture."""
-        try:
-            self.logger.info(f"Building model with input shape: {self.input_shape}")
-            inputs = Input(shape=self.input_shape)
-            x = inputs
+        self.logger.info("Building model architecture...")
+        inputs = Input(shape=self.input_shape)
+        x = inputs
 
-            # LSTM layers with return_sequences=True for attention
-            for i, units in enumerate(self.lstm_units):
-                x = Bidirectional(LSTM(units, return_sequences=True))(x)
-                x = BatchNormalization()(x)
-                x = Dropout(self.dropout_rate)(x)
-                self.logger.info(f"LSTM layer {i} output shape: {x.shape}")
+        for i, units in enumerate(self.lstm_units):
+            return_sequences = (i < len(self.lstm_units) - 1)
+            x = Bidirectional(LSTM(units, return_sequences=return_sequences))(x)
+            x = Dropout(self.dropout_rate)(x)
 
-            # Attention mechanism
-            attention_output = Attention()([x, x])
-            self.logger.info(f"Attention output shape: {attention_output.shape}")
+        for i, units in enumerate(self.dense_units):
+            x = Dense(units, activation="relu")(x)
+            x = Dropout(self.dropout_rate)(x)
 
-            # Global Average Pooling to reduce sequence dimension
-            x = GlobalAveragePooling1D()(attention_output)
-            self.logger.info(f"GlobalAveragePooling1D output shape: {x.shape}")
+        output = Dense(1, name="price_prediction")(x)
 
-            # Dense layers
-            for i, units in enumerate(self.dense_units):
-                x = Dense(units, activation='relu')(x)
-                x = BatchNormalization()(x)
-                x = Dropout(self.dropout_rate)(x)
-                self.logger.info(f"Dense layer {i} output shape: {x.shape}")
+        self.model = tf.keras.Model(inputs, output)
+        self.logger.info("Model architecture built successfully.")
 
-            # Single output for price prediction
-            output = Dense(1, name='price_prediction')(x)
-            self.logger.info(f"Output shape: {output.shape}")
+    def compile(
+        self,
+        optimizer: Optional[tf.keras.optimizers.Optimizer] = None,
+        loss: Optional[Union[str, Callable]] = None,
+    ) -> None:
+        if self.model is None:
+            raise ValueError("Model not built. Call build() first.")
 
-            # Model assembly
-            self.model = Model(inputs=inputs, outputs=output)
-            self.logger.info("Model built successfully")
-
-        except Exception as e:
-            self.logger.error(f"Error building model: {str(e)}")
-            raise
-
-    def compile(self, optimizer=None, loss="mse") -> None:
-        """
-        Compile model with a single loss function and streamlined metrics.
-        """
-        try:
-            if optimizer is None:
+        if optimizer is None:
+            if self.clip_norm:
+                optimizer = Adam(learning_rate=self.learning_rate, clipnorm=self.clip_norm)
+            else:
                 optimizer = Adam(learning_rate=self.learning_rate)
+            self.logger.info("Using default Adam optimizer.")
 
-            self.model.compile(
-                optimizer=optimizer,
-                loss=loss,
-                metrics=["mae", RootMeanSquaredError(), directional_accuracy],
-            )
+        if loss is None:
+            loss = di_mse_loss
+            self.logger.info("Using DI-MSE loss for direction-integrated regression.")
 
-            self.compiled = True
-            self.logger.info("Model compiled successfully")
-
-        except Exception as e:
-            self.logger.error(f"Error compiling model: {str(e)}")
-            raise
+        self.model.compile(
+            optimizer=optimizer,
+            loss=loss,
+            metrics=["mae", RootMeanSquaredError(name="rmse"), directional_accuracy]
+        )
+        self.compiled = True
+        self.logger.info("Model compiled successfully.")
 
     def fit(
         self,
         X_train: np.ndarray,
         y_train: np.ndarray,
-        epochs: int,
-        batch_size: int,
+        epochs: int = 50,
+        batch_size: int = 32,
         validation_data: Optional[Tuple[np.ndarray, np.ndarray]] = None,
         callbacks: Optional[List[tf.keras.callbacks.Callback]] = None,
-        verbose: int = 1,
+        verbose: int = 1
     ) -> tf.keras.callbacks.History:
-        """
-        Train the model.
+        if self.model is None or not self.compiled:
+            raise ValueError("Model not ready. Ensure it's built and compiled.")
 
-        Args:
-            X_train: Training features
-            y_train: Training targets
-            epochs: Number of training epochs
-            batch_size: Batch size
-            validation_data: Tuple of (X_val, y_val)
-            callbacks: List of Keras callbacks
-            verbose: Verbosity level for training (default: 1)
+        self.logger.info(f"Training model for {epochs} epochs and batch size {batch_size}.")
+        history = self.model.fit(
+            X_train, y_train,
+            validation_data=validation_data,
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=verbose
+        )
+        self.logger.info("Training complete.")
+        return history
 
-        Returns:
-            Training history
-        """
-        try:
-            if self.model is None:
-                raise ValueError("Model not built. Call build() first.")
-
-            # Pass all arguments to the underlying Keras model's fit method
-            history = self.model.fit(
-                X_train,
-                y_train,
-                validation_data=validation_data,
-                epochs=epochs,
-                batch_size=batch_size,
-                callbacks=callbacks,
-                verbose=verbose,
-            )
-
-            self.logger.info("Model training completed")
-            return history
-
-        except Exception as e:
-            self.logger.error(f"Error training model: {str(e)}")
-            raise
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        Generate predictions.
-
-        Args:
-            X: Input features
-
-        Returns:
-            Array of predictions
-        """
-        try:
-            if self.model is None:
-                raise ValueError("Model not built. Call build() first.")
-
-            return self.model.predict(X)
-
-        except Exception as e:
-            self.logger.error(f"Error generating predictions: {str(e)}")
-            raise
-
-    def evaluate(self, X: np.ndarray, y: np.ndarray) -> List[float]:
-        """
-        Evaluate the model.
-
-        Args:
-            X: Input features
-            y: True values
-
-        Returns:
-            List of metric values
-        """
-        try:
-            if self.model is None:
-                raise ValueError("Model not built. Call build() first.")
-
-            return self.model.evaluate(X, y)
-
-        except Exception as e:
-            self.logger.error(f"Error evaluating model: {str(e)}")
-            raise
-
-    def save_history(self, history, path: Union[str, Path]) -> None:
-        """
-        Save training history to a JSON file.
-
-        Args:
-            history: Keras training history or dictionary
-            path: Path to save the history
-        """
-        try:
-            if isinstance(history, tf.keras.callbacks.History):
-                history_dict = {
-                    key: [float(value) for value in values]
-                    for key, values in history.history.items()
-                }
-            elif isinstance(history, dict):
-                history_dict = history
-            else:
-                raise ValueError("Unsupported history object type")
-
-            with open(path, "w") as f:
-                json.dump(history_dict, f)
-        except Exception as e:
-            self.logger.error(f"Error saving training history: {e}")
-            raise
-
-    def save(self, path: Union[str, Path], coin_name: str) -> None:
-        """
-        Save the model to the specified path, including metadata.
-
-        Args:
-            path: Path to save the model.
-            coin_name: Name of the coin for metadata.
-        """
+    def predict(self, X: np.ndarray, verbose: int = 0) -> np.ndarray:
         if self.model is None:
             raise ValueError("Model not built. Call build() first.")
 
-        # Add metadata file
-        metadata_path = Path(path).with_suffix(".json")
-        metadata = {
-            "coin_name": coin_name,
-            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
-        }
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f)
+        self.logger.info("Generating predictions...")
+        preds = self.model.predict(X, verbose=verbose)
+        return preds
 
-        # Save the model
+    def evaluate(self, X: np.ndarray, y: np.ndarray, verbose: int = 0) -> Dict[str, float]:
+        if self.model is None or not self.compiled:
+            raise ValueError("Model not ready. Ensure it's built and compiled.")
+
+        self.logger.info("Evaluating model...")
+        results = self.model.evaluate(X, y, verbose=verbose)
+        metrics_names = ["loss", "mae", "rmse", "directional_accuracy"]
+        metrics = {name: float(val) for name, val in zip(metrics_names, results)}
+        self.logger.info(f"Evaluation results: {metrics}")
+        return metrics
+
+    def save_history(self, history: Union[tf.keras.callbacks.History, Dict], path: Union[str, Path]) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(history, tf.keras.callbacks.History):
+            history_dict = {k: [float(x) for x in v] for k, v in history.history.items()}
+        else:
+            history_dict = history
+
+        with open(path, "w") as f:
+            json.dump(history_dict, f, indent=4)
+
+        self.logger.info(f"History saved to {path}.")
+
+    def save(self, path: Union[str, Path]) -> None:
+        if self.model is None:
+            raise ValueError("Model not built. Call build() first.")
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.model.save(path)
+        self.logger.info(f"Model saved to {path}.")
 
     @classmethod
-    def load_model_by_criteria(
-        cls, models_dir: Union[str, Path], coin_name: str, latest: bool = True
-    ) -> "CryptoPredictor":
-        """
-        Load a model matching a coin name and criteria.
+    def load(cls, model_path: Union[str, Path]) -> "CryptoPredictor":
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found at {model_path}.")
 
-        Args:
-            models_dir: Directory containing models.
-            coin_name: Coin name to filter models.
-            latest: Whether to load the latest model.
-
-        Returns:
-            Loaded CryptoPredictor instance.
-        """
-        models_dir = Path(models_dir)
-        metadata_files = list(models_dir.glob("*.json"))
-
-        # Match models by metadata
-        matching_models = []
-        for meta_file in metadata_files:
-            with open(meta_file, "r") as f:
-                metadata = json.load(f)
-                if metadata.get("coin_name") == coin_name:
-                    matching_models.append(
-                        {
-                            "model_path": meta_file.with_suffix(".keras"),
-                            "timestamp": metadata.get("timestamp"),
-                        }
-                    )
-
-        if not matching_models:
-            raise FileNotFoundError(f"No models found for coin: {coin_name}")
-
-        # Sort by timestamp and select
-        matching_models.sort(key=lambda x: x["timestamp"], reverse=latest)
-        selected_model = matching_models[0]
-
-        return cls.load(selected_model["model_path"])
-
-    @classmethod
-    def load(cls, path: Union[str, Path]) -> "CryptoPredictor":
-        """
-        Load a saved model.
-
-        Args:
-            path: Path to saved model
-
-        Returns:
-            Loaded CryptoPredictor instance
-        """
-        try:
-            keras_model = tf.keras.models.load_model(
-                path,
-                custom_objects={"directional_accuracy": directional_accuracy},
-            )
-
-            # Create a new CryptoPredictor instance
-            input_shape = keras_model.input_shape[1:]
-            predictor = cls(
-                input_shape=input_shape,
-                lstm_units=[],
-                dropout_rate=0.0,
-                dense_units=[],
-                attention_units=0,
-                learning_rate=0.001,
-            )
-            predictor.model = keras_model
-            predictor.compiled = True  # Assume the model is already compiled
-
-            return predictor
-
-        except Exception as e:
-            logging.error(f"Error loading model: {str(e)}")
-            raise
-
-
-if __name__ == "__main__":
-    # Example usage
-    model = CryptoPredictor(
-        input_shape=(60, 20),
-        lstm_units=[64, 32],
-        dropout_rate=0.2,
-        dense_units=[16],
-        attention_units=32,
-        learning_rate=0.001,
-    )
-
-    model.build()
-    model.compile()
-
-    # Print model summary
-    model.model.summary()
+        keras_model = tf.keras.models.load_model(
+            model_path,
+            custom_objects={
+                "directional_accuracy": directional_accuracy,
+                "di_mse_loss": di_mse_loss
+            }
+        )
+        input_shape = keras_model.input_shape[1:]
+        predictor = cls(input_shape=input_shape)
+        predictor.model = keras_model
+        predictor.compiled = True
+        logging.info(f"Loaded model from {model_path}")
+        return predictor
